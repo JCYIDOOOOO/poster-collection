@@ -271,7 +271,6 @@ const fragmentShader = /* glsl */`
 
     if (inImg && imgAlpha > 0.0) {
       vec2 atlasUV = (atlasPos + imgUV) / uAtlasSize;
-      atlasUV.y = 1.0 - atlasUV.y;
       vec3 imgColor = texture2D(uImageAtlas, atlasUV).rgb;
       color = mix(color, imgColor, imgAlpha);
     }
@@ -287,49 +286,81 @@ const fragmentShader = /* glsl */`
 `;
 
 /* ================================================================
-   TEXTURE ATLAS — pack all posters into one texture
+   TEXTURE ATLAS — robust loading, fallback for failed images
    ================================================================ */
-async function loadImage(src) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = src;
-  });
+function createPlaceholder(text) {
+  const c = document.createElement('canvas');
+  c.width = 400; c.height = 560;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#1a1a1e'; cx.fillRect(0, 0, c.width, c.height);
+  cx.fillStyle = '#444'; cx.font = '16px "Inter",sans-serif'; cx.textAlign = 'center';
+  cx.fillText(text, c.width / 2, c.height / 2);
+  return c;
+}
+
+async function loadImage(src, fallbackText) {
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => {
+        if (i.naturalWidth === 0 || i.naturalHeight === 0) {
+          reject(new Error('zero-size image'));
+        } else {
+          resolve(i);
+        }
+      };
+      i.onerror = () => reject(new Error(`failed to load: ${src}`));
+      i.src = src;
+    });
+    return img;
+  } catch (err) {
+    console.warn(`Image load failed for "${src}", using placeholder.`, err.message);
+    return createPlaceholder(fallbackText);
+  }
 }
 
 async function createAtlas(images) {
   const count = images.length;
   const atlasSize = Math.ceil(Math.sqrt(count));
-  const cellSize = 512;
+  const cellSize = 400; // smaller cell = safer atlas (max 2400px for 32 imgs)
   const size = atlasSize * cellSize;
 
+  // Clamp canvas size to browser limit (~4096 safe)
+  const MAX_ATLAS = 4096;
+  const finalSize = Math.min(size, MAX_ATLAS);
+  const finalCell = Math.floor(finalSize / atlasSize);
+
   const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = size;
+  canvas.width = canvas.height = finalSize;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = '#0a0a0a';
-  ctx.fillRect(0, 0, size, size);
+  ctx.fillRect(0, 0, finalSize, finalSize);
 
   for (let i = 0; i < count; i++) {
     const img = images[i];
-    const x = (i % atlasSize) * cellSize;
-    const y = Math.floor(i / atlasSize) * cellSize;
-    // Scale to fit cell with padding
-    const pad = 20;
-    const dw = cellSize - pad * 2;
-    const dh = cellSize - pad * 2;
-    const scale = Math.min(dw / img.width, dh / img.height);
-    const iw = img.width * scale;
-    const ih = img.height * scale;
-    ctx.drawImage(img, x + (cellSize - iw) / 2, y + (cellSize - ih) / 2, iw, ih);
+    const x = (i % atlasSize) * finalCell;
+    const y = Math.floor(i / atlasSize) * finalCell;
+    const pad = 16;
+    const dw = finalCell - pad * 2;
+    const dh = finalCell - pad * 2;
+    const srcW = img.naturalWidth || img.width || 400;
+    const srcH = img.naturalHeight || img.height || 560;
+    const scale = Math.min(dw / srcW, dh / srcH);
+    const iw = srcW * scale;
+    const ih = srcH * scale;
+    if (iw > 0 && ih > 0) {
+      ctx.drawImage(img, x + (finalCell - iw) / 2, y + (finalCell - ih) / 2, iw, ih);
+    }
   }
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.wrapS = texture.wrapT = THREE.ClampToEdgeWrapping;
   texture.minFilter = THREE.LinearFilter;
   texture.magFilter = THREE.LinearFilter;
-  texture.flipY = false;
-  return { texture, atlasSize, cellSize };
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.flipY = true;
+  texture.needsUpdate = true;
+  return { texture, atlasSize, cellSize: finalCell };
 }
 
 /* ================================================================
@@ -342,7 +373,7 @@ async function initGallery(imageList) {
   if (plane) { scene.remove(plane); if (plane.geometry) plane.geometry.dispose(); if (plane.material) plane.material.dispose(); }
 
   const count = imageList.length;
-  const images = await Promise.all(imageList.map(p => loadImage(p.image)));
+  const images = await Promise.all(imageList.map(p => loadImage(p.image, p.label)));
   const atlas = await createAtlas(images);
 
   uniforms = {
